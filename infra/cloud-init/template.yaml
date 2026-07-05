@@ -1,0 +1,51 @@
+#cloud-config
+# cloud-init para ntp-template — VM base clonada para todos os papeis.
+# Instala chrony + logger systemd unit (disabled). O papel concreto
+# (servidor / cliente-step / cliente-slew) e aplicado depois do clone
+# via apply-role.sh.
+
+packages:
+  - chrony
+
+write_files:
+  - path: /usr/local/bin/log-offset.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      HOSTNAME=$(hostname)
+      CSV=/var/log/chrony/offset-${HOSTNAME}.csv
+      if [ ! -f "$CSV" ]; then
+        echo "timestamp,last_offset_s,rms_offset_s,frequency_ppm" > "$CSV"
+      fi
+      while true; do
+        TS=$(date -Ins)
+        LINE=$(chronyc tracking 2>/dev/null | awk -F': *' '
+          /Last offset/    {gsub(/ seconds/, "", $2); lo=$2}
+          /RMS offset/     {gsub(/ seconds/, "", $2); ro=$2}
+          /Frequency/      {split($2, a, " "); f=a[1]; if (a[2]=="ppm" && a[3]=="slow") f=-f; }
+          END {print lo "," ro "," f}')
+        echo "${TS},${LINE}" >> "$CSV"
+        sleep 1
+      done
+
+  - path: /etc/systemd/system/log-offset.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=NTP offset CSV logger
+      After=chrony.service
+      Requires=chrony.service
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/log-offset.sh
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  # chrony fica instalado mas ainda nao configurado; apply-role.sh fara isso.
