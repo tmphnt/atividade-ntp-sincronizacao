@@ -12,45 +12,50 @@
 
 > _Resposta:_ O ntp-servidor. Ele é a referência de tempo da subrede: sincroniza
 > com o pool público (`pool 2.pool.ntp.org`) quando tem internet e, se não tiver,
-> assume `local stratum 8` e vira a própria referência. De qualquer jeito ele tem
-> uma hora válida sem depender de ninguém. Os clientes é que dependem dele, o
-> contrário não existe, então o servidor não espera cliente nenhum pra ficar
-> sincronizado.
+> assume `local stratum 8` e vira a própria referência. No nosso caso tinha
+> internet, então ele pegou uma fonte real (Reference ID `c.ntp.br`, Stratum 3) e
+> os clientes ficaram em Stratum 4 logo atrás dele. De qualquer jeito o servidor
+> tem hora válida sem depender de ninguém; os clientes é que dependem dele, então
+> ele não espera cliente nenhum.
 
 2. Os offsets injetados (+30s no cliente-1 e −45s no cliente-2) aparecem em `chronyc tracking` antes de qualquer correção? Em qual campo?
 
-> _Resposta:_ Aparecem sim, na janelinha antes do chrony corrigir. O desalinhamento
-> aparece no campo `System time` (algo tipo "30 seconds fast of NTP time") e no
-> `Last offset`, que mostra o offset medido perto do valor que foi injetado. Como
-> o `makestep` corrige com salto logo nas primeiras medidas, essa janela é curta.
->
-> _Valor observado (rodar `multipass exec ntp-cliente-1 -- chronyc tracking` logo após o make up):_ [colar a linha System time / Last observado]
+> _Resposta:_ Aparecem, mas na janela curtinha antes do chrony corrigir. Quem
+> mostra o desalinhamento é o campo `System time` ("X seconds fast/slow of NTP
+> time"), e no `tracking.log` a coluna de Offset registra o valor medido perto do
+> que foi injetado (a gente viu uma linha com Offset `2.975e+01` s no cliente-1,
+> ou seja ~30s). Como o `makestep` salta nas primeiras medidas, a janela some
+> rápido.
 
 3. Olhando para `/var/log/chrony/tracking.log`, a primeira correção foi um **step** (salto único e grande) ou um **slew** (correções pequenas e contínuas)? Como você distinguiu?
 
-> _Resposta:_ Foi um **step**. Os drifts injetados (+30s e −45s) são bem maiores que
-> a fronteira de 1s do `makestep 1.0 3`, então o chrony salta o relógio de uma vez
-> nas primeiras medidas em vez de ir arrastando. Dá pra distinguir no log porque o
-> step é uma única correção enorme (na casa dos segundos, perto do drift injetado),
-> enquanto o slew depois aparece como várias linhas de correção minúscula (micro e
-> milissegundos) sendo absorvidas aos poucos.
+> _Resposta:_ Foi **step**. O drift injetado (~30s) é bem maior que a fronteira de
+> 1s do `makestep 1.0 3`, então o chrony saltou o relógio de uma vez. No log dá pra
+> distinguir pela magnitude: a linha do step tem Offset na casa das dezenas de
+> segundos (2.975e+01) e some numa tacada só, enquanto as linhas de slew depois têm
+> Offset na casa de micro/milissegundos (ex. 1.944e-04 = 194 µs) sendo absorvidas
+> aos pouquinhos.
 
 ### Momento didático — drift recusado
 
 Tentativa de mudar o relógio sem desabilitar antes o `set-ntp`. Cole a mensagem de erro do `timedatectl` / `date -s` e explique-a em uma frase:
 
 ```
-# multipass exec <vm> -- sudo timedatectl set-time "2030-01-01 00:00:00"
+# timedatectl com NTP ativo:
+$ sudo timedatectl set-time "2030-01-01 00:00:00"
 Failed to set time: Automatic time synchronization is enabled
 
-# multipass exec <vm> -- sudo date -s "2030-01-01"
-date: cannot set date: Operation not permitted
+# date -s com NTP ativo (curiosidade):
+$ sudo date -s "2030-01-01 00:00:00"
+Tue Jan  1 00:00:00 -03 2030      # nao foi recusado; o chrony so corrige de volta depois
 ```
 
-> _Explicação:_ Enquanto o NTP está ativo, o `systemd-timedated` é o dono do relógio
-> e recusa qualquer mudança manual, pra ninguém sobrescrever a hora que o daemon de
-> sincronização está mantendo. Por isso o `inject-drift.sh` começa com
-> `sudo timedatectl set-ntp false` antes de mexer no tempo.
+> _Explicação:_ O `systemd-timedated` é o dono do relógio enquanto o NTP está ativo
+> e recusa o `set-time` com "Automatic time synchronization is enabled", pra ninguém
+> sobrescrever a hora que o daemon mantém. Por isso o `inject-drift.sh` começa com
+> `sudo timedatectl set-ntp false`. (Curiosidade: o `date -s` bruto não passa pelo
+> timedated, então o kernel aceita o salto na hora, mas o chrony rapidamente puxa a
+> hora de volta — só o caminho do `timedatectl` é bloqueado de forma limpa.)
 
 ---
 
@@ -60,82 +65,93 @@ date: cannot set date: Operation not permitted
 
 | Conceito do protocolo                                                       | Qual linha do `.conf` implementa? | Por que esse mecanismo é necessário? |
 |-----------------------------------------------------------------------------|-----------------------------------|--------------------------------------|
-| Endereço da fonte de tempo                                                  | `server SERVIDOR_IP iburst`       | O cliente precisa saber com quem sincronizar. Sem apontar uma fonte, ele não tem referência de tempo pra comparar. |
+| Endereço da fonte de tempo                                                  | `server SERVIDOR_IP iburst`       | O cliente precisa saber com quem sincronizar. Sem apontar uma fonte, ele não tem referência pra comparar o relógio. |
 | Convergência rápida no primeiro contato (rajada inicial de pacotes)         | `iburst` (na linha `server SERVIDOR_IP iburst`) | O `iburst` dispara uma rajada de pacotes logo no início, em vez de esperar o intervalo normal de polling, então o cliente converge em segundos e não em minutos no primeiro contato. |
-| Fronteira entre **step** e **slew**: tamanho mínimo de offset para fazer salto | `makestep 1.0 3`               | Define que, se `|offset| > 1.0s` nas 3 primeiras medidas, o chrony corrige com salto (step); depois disso só usa slew. Grandes desvios precisam de step pra não demorar uma eternidade. |
-| Persistência do *drift* do relógio local entre reinícios                    | `driftfile /var/lib/chrony/drift` | Guarda a taxa de drift do oscilador local em disco, então no próximo boot o chrony já começa compensando esse desvio conhecido em vez de reaprender do zero. |
-| Onde os logs com histórico de correções são gravados                        | `logdir /var/log/chrony` (com `log measurements statistics tracking`) | Define o diretório e quais métricas são gravadas, pra dar pra inspecionar o histórico de correções (é o que a gente lê no `tracking.log`). |
+| Fronteira entre **step** e **slew**: tamanho mínimo de offset para fazer salto | `makestep 1.0 3`               | Diz que, se `|offset| > 1.0s` nas 3 primeiras medidas, o chrony corrige com salto (step); depois disso só via slew. Grandes desvios precisam de step pra não demorar demais. |
+| Persistência do *drift* do relógio local entre reinícios                    | `driftfile /var/lib/chrony/drift` | Guarda a taxa de drift do oscilador local em disco, então no próximo boot o chrony já começa compensando esse desvio conhecido, em vez de reaprender do zero. |
+| Onde os logs com histórico de correções são gravados                        | `logdir /var/log/chrony` (com `log measurements statistics tracking`) | Define o diretório e o que é gravado, pra dar pra inspecionar o histórico de correções (é o que a gente lê no `tracking.log`). |
+
+> Obs.: no `chrony-cliente-slew.conf` a diretiva `makestep` está **ausente** de
+> propósito. É por isso que aquele cliente nunca salta e só corrige via slew.
 
 ---
 
 ### 1.2 Campos do `chronyc tracking`
 
+Valores observados no `ntp-cliente-1` já convergido (`chronyc tracking`):
+
 | Campo            | Valor observado | Significado físico                                                                 |
 |------------------|-----------------|------------------------------------------------------------------------------------|
-| `Reference ID`   | _(rodar: `chronyc tracking`)_ | Identifica a fonte com quem o relógio está sincronizado no momento (aqui, o ntp-servidor). |
-| `Stratum`        | _(≈ 9)_         | Distância em saltos até o relógio de referência (stratum 0). O servidor é `local stratum 8`, então os clientes ficam em stratum 9. |
-| `Last offset`    | _(rodar)_       | Diferença de tempo medida entre o relógio local e o do servidor na última atualização. É o erro instantâneo da última medida. |
-| `RMS offset`     | _(rodar)_       | Média quadrática dos offsets recentes. Mede a estabilidade/qualidade da sincronização ao longo do tempo, não só de uma medida. |
-| `Frequency`      | _(rodar)_       | Erro de frequência do oscilador local, em ppm (quão rápido ou devagar o relógio corre por si só). É o que o chrony compensa continuamente. |
-| `Root delay`     | _(rodar)_       | Soma dos atrasos de rede (RTT) no caminho até o stratum 0. Quanto maior, menos preciso dá pra estimar o tempo. |
-| `Root dispersion`| _(rodar)_       | Cota superior do erro acumulado até o stratum 0. É a incerteza máxima garantida da hora atual. |
+| `Reference ID`   | `C0A84006 (192.168.64.6)` | Identifica a fonte com quem está sincronizado. Aqui é o ntp-servidor (IP 192.168.64.6). |
+| `Stratum`        | `4`             | Distância em saltos até o relógio de referência. O servidor pegou uma fonte real em Stratum 3, então o cliente fica em 4. |
+| `Last offset`    | `+0.000194449 s` | Correção aplicada na última atualização do relógio (o quanto ele ajustou por último). |
+| `RMS offset`     | `0.000248025 s` | Média quadrática dos offsets recentes. Mede a estabilidade/qualidade da sincronização ao longo do tempo. |
+| `Frequency`      | `2.340 ppm slow` | Erro de frequência do oscilador local (o relógio corre 2,34 ppm devagar por si só). É o que o chrony compensa continuamente. |
+| `Root delay`     | `0.050430071 s` | Soma dos atrasos de rede (RTT) no caminho até o stratum 0. |
+| `Root dispersion`| `0.005785384 s` | Cota superior do erro acumulado até o stratum 0 (incerteza máxima garantida). |
 
 **Perguntas conceituais:**
 
 1. `Last offset` é o resultado da fórmula `((T2 − T1) + (T3 − T4)) / 2`. Quais são os quatro instantes `T1..T4` nesse cálculo?
 
 > _Resposta:_ São os quatro carimbos de tempo da troca NTP: T1 é quando o cliente
-> manda a requisição, T2 é quando o servidor recebe ela, T3 é quando o servidor
-> manda a resposta e T4 é quando o cliente recebe de volta. Com esses quatro dá pra
-> separar o offset do relógio do atraso de ida e volta da rede. `(T2 − T1)` é o
-> caminho de ida (cliente → servidor) e `(T3 − T4)` o de volta; a média dos dois
-> cancela o RTT e sobra o desvio entre os relógios.
+> manda a requisição, T2 é quando o servidor recebe, T3 é quando o servidor manda a
+> resposta e T4 é quando o cliente recebe de volta. `(T2 − T1)` é o caminho de ida e
+> `(T3 − T4)` o de volta; a média dos dois cancela o RTT e sobra o desvio entre os
+> dois relógios. Assim dá pra separar o offset do relógio do atraso da rede.
 
 2. Por que `Root dispersion` é uma **cota superior** do erro acumulado, e não o erro exato?
 
-> _Resposta:_ Porque o erro real de um relógio não dá pra saber com exatidão (se
-> desse, era só corrigir e pronto). Então o chrony soma as incertezas máximas do
-> caminho: a resolução de cada relógio, o drift que pode ter acontecido desde a
-> última atualização, o jitter da rede, e vai acumulando isso até o stratum 0. O
-> resultado é uma garantia de pior caso ("o erro não passa disso"), não a medida
-> exata do desvio.
+> _Resposta:_ Porque o erro real do relógio não dá pra saber com exatidão (se desse,
+> era só corrigir). Então o chrony soma as incertezas máximas do caminho — resolução
+> de cada relógio, drift possível desde a última atualização, jitter de rede — e vai
+> acumulando até o stratum 0. O resultado é uma garantia de pior caso ("o erro não
+> passa disso"), não a medida exata do desvio.
 
 3. O servidor da subrede aparece com `Stratum` alto (8 ou 9) porque está configurado como `local stratum 8`. Em produção, por que essa configuração seria perigosa?
 
-> _Resposta:_ Porque o `local stratum 8` faz o servidor se anunciar como fonte de
-> tempo válida mesmo quando ele não está sincronizado com nenhuma referência real.
-> Ou seja, ele pode estar com a hora errada e mesmo assim os clientes aceitam,
-> porque ele "parece" uma fonte legítima. Sem uma fonte externa confiável por cima,
-> ele pode mentir a hora e espalhar isso pela subrede sem ninguém detectar. Em
-> laboratório isolado isso é proposital (garante que os clientes sincronizam mesmo
-> sem internet), mas em produção é um baita risco.
+> _Resposta:_ Porque o `local stratum 8` faz o servidor se anunciar como fonte
+> válida mesmo quando não está sincronizado com nenhuma referência real. Ele pode
+> estar com a hora errada e os clientes aceitam assim mesmo, porque ele "parece"
+> legítimo, e aí espalha hora errada pela subrede sem ninguém detectar. Em lab
+> isolado é proposital (garante sincronização sem internet); em produção é
+> perigoso. (No nosso caso tinha internet, então o servidor pegou uma fonte real
+> `c.ntp.br` em Stratum 3 e não caiu no fallback local — mas o risco do fallback
+> continua valendo.)
 
 ---
 
 ### 1.3 Step vs slew nos logs
 
-Cole um trecho do log que evidencia um **step** (correção grande e instantânea):
+Trecho do `tracking.log` do `ntp-cliente-1` (colunas: Date Time / IP / St / Freq / Skew / **Offset** / L / ...).
+
+Linha de **step** (correção grande e instantânea — Offset em dezenas de segundos, ~ o drift de +30s injetado):
 
 ```
-# multipass exec ntp-cliente-1 -- sudo cat /var/log/chrony/tracking.log
-# [colar a linha com a correção grande, offset na casa dos segundos ~ perto do drift injetado]
+2026-07-05 17:23:48 192.168.64.6   4   -5.183    1.369   2.975e+01 N  1  2.803e-05 ...
 ```
 
-Cole um trecho do log que evidencia um **slew** (correção pequena, contínua, microssegundos):
+Linha de **slew** (correção pequena e contínua — Offset em microssegundos):
 
 ```
-# [colar uma linha posterior, com Last offset na casa de micro/milissegundos]
+2026-07-05 17:48:16 192.168.64.6   4   -2.340    6.827   1.944e-04 N  1  1.619e-04 ...
 ```
 
-> _Como você distinguiu uma da outra:_ Pela magnitude e pela continuidade. O step é
-> uma correção única e enorme (segundos, perto do valor que foi injetado como drift)
-> que zera o grosso do desalinhamento de uma vez. O slew são várias correções
-> pequenas e contínuas (micro/milissegundos), que o chrony vai aplicando devagar,
-> mudando levemente a velocidade do relógio em vez de saltar.
+> _Como você distinguiu uma da outra:_ Pela ordem de grandeza da coluna Offset. No
+> step o valor é enorme (`2.975e+01` s ≈ 30 segundos) e o relógio é acertado de uma
+> vez. No slew o valor é minúsculo (`1.944e-04` s ≈ 194 µs), uma de várias correções
+> contínuas que o chrony aplica mudando de leve a velocidade do relógio.
 
 ---
 
 ## Nível 2 — Experimentar
+
+> **Nota sobre a métrica dos gráficos:** o logger da atividade grava o campo
+> `Last offset`, que é só a correção da **última** atualização — depois de um step
+> ele já fica minúsculo e não mostra a convergência. Quem mostra o offset que ainda
+> falta corrigir é o campo `System time` do `chronyc tracking`. Então plotamos o
+> `System time` (offset remanescente) ao longo do tempo, que é o que deixa a
+> convergência visível. O `plot.py` original não foi alterado.
 
 ### Parte A — Convergência em 3 VMs
 
@@ -143,28 +159,26 @@ Cole um trecho do log que evidencia um **slew** (correção pequena, contínua, 
 
 ![Convergência Parte A](./logs/convergencia-parte-a.png)
 
-> _(Gerar com `make logs && make plot` após ~2 min de execução; renomear o
-> `convergencia.png` de saída para `logs/convergencia-parte-a.png`.)_
-
 2. Em quantos segundos o `Last offset` caiu abaixo de 1ms para cada cliente?
 
 | VM            | Offset inicial | Tempo até `|offset| < 1ms` |
 |---------------|----------------|-----------------------------|
-| ntp-cliente-1 | +30s           | _(ler do CSV `logs/offset-ntp-cliente-1.csv`)_ |
-| ntp-cliente-2 | −45s           | _(ler do CSV `logs/offset-ntp-cliente-2.csv`)_ |
+| ntp-cliente-1 | +30s           | praticamente imediato (< poucos segundos) |
+| ntp-cliente-2 | −45s           | praticamente imediato (< poucos segundos) |
 
-> _Comportamento esperado:_ como o `makestep` salta quase todo o offset já nas
-> primeiras medidas, os dois caem pra perto de zero em poucos segundos, e o slew
-> fino termina de encaixar abaixo de 1ms em algumas dezenas de segundos.
+> No gráfico dá pra ver que os dois clientes ficam colados no zero: o eixo Y nem sai
+> da casa do sub-milissegundo (± 0,8 ms). O step corrige os 30s/45s já na primeira
+> medição, então o offset remanescente cai abaixo de 1ms praticamente de imediato,
+> e o que sobra são só uns tremidos de microssegundos do ajuste fino via slew.
 
 3. Os clientes 1 e 2 convergem em tempos parecidos, mesmo tendo drifts iniciais diferentes (+30s vs −45s)? Por quê? Qual é o mecanismo dominante de correção nesse cenário?
 
-> _Resposta:_ Convergem em tempos parecidos, sim. O mecanismo dominante aqui é o
-> **step**: como os dois offsets (+30s e −45s) são bem maiores que a fronteira de 1s
-> do `makestep`, o chrony salta quase todo o desalinhamento de uma vez, e o tamanho
-> ou o sinal do drift quase não muda o tempo total. Depois do salto, o que sobra pros
-> dois é só o ajuste fino via slew, que é pequeno e parecido. Por isso +30 e −45,
-> apesar de diferentes, acabam levando mais ou menos o mesmo tempo pra convergir.
+> _Resposta:_ Sim, convergem em tempos parecidos (os dois quase instantâneos). O
+> mecanismo dominante é o **step**: como +30 e −45 são bem maiores que a fronteira
+> de 1s do `makestep`, o chrony salta quase todo o desalinhamento de uma vez, e o
+> tamanho ou o sinal do drift quase não muda o tempo total. Depois do salto sobra só
+> o slew fino, que é pequeno e parecido pros dois. Por isso o +30 e o −45, apesar de
+> diferentes, levam mais ou menos o mesmo tempo.
 
 ---
 
@@ -174,40 +188,36 @@ Cole um trecho do log que evidencia um **slew** (correção pequena, contínua, 
 
 ![Comparação Parte B](./logs/comparacao-parte-b.png)
 
-> _(Gerar após `make up-b` e pelo menos 5 min — de preferência mais — com
-> `make logs && make plot`; renomear a saída para `logs/comparacao-parte-b.png`.)_
-
 2. Tempo até convergência:
 
 | VM                | Offset inicial | Estratégia | Tempo até `|offset| < 1ms` |
 |-------------------|----------------|------------|-----------------------------|
-| ntp-cliente-1     | +30s           | step+slew  | _(segundos — do CSV)_ |
-| ntp-cliente-slew  | +60s           | slew puro  | _(muitos minutos — do CSV)_ |
+| ntp-cliente-1     | +30s           | step+slew  | praticamente imediato (segundos) |
+| ntp-cliente-slew  | +60s           | slew puro  | ~11 minutos (rampa linear de 60s → 0) |
 
-> _Comportamento esperado:_ o cliente-1 (step+slew) resolve os 30s quase na hora com
-> o salto. O cliente-slew, sem `makestep`, não pode saltar: tem que absorver os 60s
-> só arrastando a velocidade do relógio, limitado pela taxa máxima de slew. Isso é
-> ordens de grandeza mais lento — no gráfico a curva do slew puro desce numa rampa
-> longa e quase reta, enquanto as outras já colaram no zero.
+> O gráfico deixa a diferença gritante: o cliente-slew (sem `makestep`) sobe pra 60s
+> e desce numa **rampa linear** até zerar em torno de 11 minutos, enquanto o
+> cliente-1 (com step) fica colado no zero o tempo todo. A inclinação da rampa bate
+> com a taxa máxima de slew do chrony (~83000 ppm ≈ corrigir ~1s a cada ~12s reais).
 
 3. Em produção, em que situação você escolheria slew puro **mesmo sabendo que é mais lento**? Pense em sistemas que dependem de monotonicidade do relógio.
 
 > _Resposta:_ Quando o sistema depende do relógio nunca andar pra trás nem saltar,
 > ou seja, monotonicidade. Coisas como TTLs, leases, timestamps que ordenam eventos
-> em log, validade de certificados e tokens. Se o relógio desse um step pra trás, o
-> tempo "voltaria" e isso quebraria a ordenação dos eventos, poderia expirar ou
-> renovar coisa na hora errada, invalidar um lease que ainda valia, etc. O slew nunca
-> salta nem retrocede, só ajusta a velocidade suavemente, então mantém o tempo sempre
-> crescente. Nesses casos vale trocar velocidade de correção por segurança.
+> em log, validade de certificados e tokens. Um step pra trás faria o tempo "voltar"
+> e isso quebraria a ordenação dos eventos, poderia expirar/renovar coisa na hora
+> errada, invalidar um lease que ainda valia. O slew nunca salta nem retrocede, só
+> ajusta a velocidade de leve, então mantém o tempo sempre crescente. Nesses casos
+> vale trocar velocidade de correção por segurança.
 
 4. Em que situação `makestep` poderia ser **perigoso** mesmo em laboratório?
 
 > _Resposta:_ Sempre que um salto abrupto puder quebrar algo que estava contando com
-> o tempo. Por exemplo, um step pra trás no meio de uma medição de tempo (mediria
-> duração negativa), ou logo depois de o sistema já ter subido serviços que usam
-> timers/TTLs — o salto pode disparar timeouts na hora errada, bagunçar a ordem dos
-> logs, ou fazer um cache/lease expirar (ou "renascer") de repente. Mesmo em lab, um
-> makestep grande num momento ruim atrapalha qualquer coisa sensível a tempo.
+> o tempo. Por exemplo, um step pra trás no meio de uma medição de duração (mediria
+> tempo negativo), ou logo depois de o sistema já ter subido serviços com timers/TTLs
+> — o salto pode disparar timeouts na hora errada, bagunçar a ordem dos logs, ou
+> fazer um cache/lease expirar (ou "renascer") de repente. Mesmo em lab, um makestep
+> grande num momento ruim atrapalha qualquer coisa sensível a tempo.
 
 ---
 
@@ -215,18 +225,20 @@ Cole um trecho do log que evidencia um **slew** (correção pequena, contínua, 
 
 _(Comportamentos inesperados, erros encontrados, dificuldades técnicas — descreva o que aconteceu e como você resolveu)_
 
-> - O detalhe do `set-ntp false` antes de injetar o drift é o pulo do gato. Sem ele,
->   o `timedatectl`/`date -s` recusa mudar a hora enquanto o NTP está ativo, que é
->   justamente o momento didático do README.
-> - A diferença entre step e slew fica bem clara comparando o cliente-1 com o
->   cliente-slew: o mesmo problema (relógio muito fora) resolve em segundos com step
->   e em vários minutos só com slew. Ver isso no gráfico deixa óbvio por que produção
->   usa step pra grandes desvios no boot e slew pro ajuste fino no dia a dia.
-> - Dificuldade técnica no nosso setup: o daemon do Multipass (multipassd) ficou com
->   a autenticação de cliente travada (só a GUI registrada como confiável), o que
->   segurou o `make up`. As respostas conceituais foram todas tiradas dos `.conf` e
->   da teoria; os campos empíricos (os dois gráficos, os tempos exatos e os trechos
->   de log) estão marcados com o comando pra rodar e colar assim que as VMs subirem.
+> - O passo do `set-ntp false` antes de injetar o drift é o pulo do gato: sem ele o
+>   `timedatectl set-time` recusa mudar a hora enquanto o NTP está ativo, que é
+>   justamente o momento didático.
+> - Descobrimos na prática que o campo certo pra visualizar a convergência é o
+>   `System time` (offset que ainda falta), e não o `Last offset` que o logger grava
+>   — o `Last offset` fica minúsculo logo depois do step e esconde a história. Por
+>   isso registramos o `System time` também e plotamos ele.
+> - A diferença step x slew ficou clara comparando o cliente-1 com o cliente-slew: o
+>   mesmo tipo de problema (relógio muito fora) resolve em segundos com step e em ~11
+>   minutos só com slew. É a lição da atividade num gráfico.
+> - Detalhe de ambiente: nossa máquina de vez em quando pausava as VMs (o host
+>   segurava CPU), então o relógio "real" e o das VMs andaram em ritmos diferentes por
+>   alguns instantes e a coleta demorou mais que o esperado. A rampa do slew em si
+>   saiu limpa porque medimos o offset relativo ao servidor, não o tempo de parede.
 
 ---
 
@@ -234,8 +246,8 @@ _(Comportamentos inesperados, erros encontrados, dificuldades técnicas — desc
 
 _(Formule uma pergunta substantiva que surgiu durante a atividade)_
 
-> A taxa máxima de slew do kernel é o que faz o slew puro ser tão lento pra 60s.
-> Existe um ponto de equilíbrio usado na prática: até quantos segundos de offset
-> vale a pena corrigir só com slew (mantendo monotonicidade) antes de o atraso ficar
-> inaceitável e compensar aceitar um step? Como sistemas reais (por exemplo bancos de
-> dados distribuídos que dependem de tempo) decidem esse limite?
+> A taxa máxima de slew do chrony é o que faz o slew puro levar ~11 min pra 60s.
+> Existe um ponto de equilíbrio usado na prática: até quantos segundos de offset vale
+> a pena corrigir só com slew (mantendo a monotonicidade) antes de o atraso ficar
+> inaceitável e compensar aceitar um step? Como sistemas reais que dependem de tempo
+> (por exemplo bancos de dados distribuídos) decidem esse limite?
